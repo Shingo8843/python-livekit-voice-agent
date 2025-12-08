@@ -1,9 +1,13 @@
+import asyncio
+import os
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer,AgentSession, Agent, room_io
+from livekit.agents import AgentServer, AgentSession, Agent, room_io
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from silence_modeling import SilenceModelingEngine, CulturalTimingRules
 
 load_dotenv(".env.local")
 instructions = """You are a helpful voice AI assistant.
@@ -21,12 +25,33 @@ server = AgentServer()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
+    # Determine language from environment or default to English
+    # In production, this would come from your Call Pack
+    language = os.getenv("AGENT_LANGUAGE", "en-US")
+    
+    # Create cultural timing rules based on language
+    if language.startswith("ja"):
+        timing_rules = CulturalTimingRules.japanese()
+    else:
+        timing_rules = CulturalTimingRules.english()
+    
+    # Configure session with cultural timing parameters
     session = AgentSession(
         stt="assemblyai/universal-streaming:en",
         llm="openai/gpt-4.1-mini",
         tts="cartesia/sonic-3:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
+        # Apply cultural timing rules
+        min_endpointing_delay=timing_rules.min_response_delay,
+        allow_interruptions=timing_rules.allow_overlap,
+        min_interruption_duration=timing_rules.min_interruption_duration,
+    )
+
+    # Create and start silence modeling engine
+    silence_engine = SilenceModelingEngine(
+        session=session,
+        timing_rules=timing_rules,
     )
 
     await session.start(
@@ -39,6 +64,17 @@ async def my_agent(ctx: agents.JobContext):
         ),
     )
 
+    # Start silence modeling engine
+    await silence_engine.start()
+
+    # Set up cleanup on session close
+    @session.on("close")
+    def on_session_close():
+        asyncio.create_task(silence_engine.stop())
+        stats = silence_engine.get_stats()
+        agents.logger.info(f"Silence modeling stats: {stats}")
+
+    # Generate initial greeting
     await session.generate_reply(
         instructions="Greet the user and offer your assistance."
     )
