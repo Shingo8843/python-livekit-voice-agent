@@ -35,6 +35,10 @@ class CulturalTimingRules:
     allow_overlap: bool
     min_interruption_duration: float
     silence_classification_thresholds: dict[str, float]  # thresholds for each silence type
+    # TTS parameters
+    tts_speed: float = 1.0  # Speech speed multiplier
+    tts_volume: float = 1.0  # Volume level (0.0 to 2.0)
+    tts_emotion: str = "neutral"  # Emotion: neutral, excited, calm, friendly, etc.
     
     @classmethod
     def japanese(cls) -> "CulturalTimingRules":
@@ -54,6 +58,9 @@ class CulturalTimingRules:
                 "end_of_speech": 2.0,
                 "disengagement": 5.0,
             },
+            tts_speed=1.0,  # Normal speed for Japanese
+            tts_volume=1.0,  # Normal volume
+            tts_emotion="calm",  # Calm and polite for Japanese
         )
     
     @classmethod
@@ -74,6 +81,9 @@ class CulturalTimingRules:
                 "end_of_speech": 1.0,
                 "disengagement": 3.0,
             },
+            tts_speed=1.0,  # Normal speed for English
+            tts_volume=1.0,  # Normal volume
+            tts_emotion="excited",  # Friendly and approachable for English
         )
 
 
@@ -241,12 +251,21 @@ class SilenceModelingEngine:
         self._is_monitoring = False
         self._response_blocked = False
         self._last_user_state = "listening"
+        self._last_agent_state = "idle"
+        
+        # Interruption tracking
+        self._agent_was_speaking = False
+        self._interruption_start_time: Optional[float] = None
+        self._interruption_transcription_received = False
+        self._false_interruption_check_task: Optional[asyncio.Task] = None
         
         # Statistics
         self.stats = {
             "silence_events": [],
             "backchannels_triggered": 0,
             "response_delays": [],
+            "interruptions": [],
+            "false_interruptions": 0,
         }
     
     async def start(self):
@@ -262,12 +281,23 @@ class SilenceModelingEngine:
     async def stop(self):
         """Stop monitoring."""
         self._is_monitoring = False
+        
+        # Cancel monitoring task
         if self._monitoring_task:
             self._monitoring_task.cancel()
             try:
                 await self._monitoring_task
             except asyncio.CancelledError:
                 pass
+        
+        # Cancel false interruption check task
+        if self._false_interruption_check_task:
+            self._false_interruption_check_task.cancel()
+            try:
+                await self._false_interruption_check_task
+            except asyncio.CancelledError:
+                pass
+        
         logger.info("Silence Modeling Engine stopped")
     
     def _setup_event_handlers(self):
@@ -290,6 +320,121 @@ class SilenceModelingEngine:
             if ev.transcript:
                 timestamp = time.time()
                 self.state_machine.update_transcription(ev.transcript, timestamp)
+                
+                # Mark that we received transcription after interruption
+                if self._interruption_start_time is not None:
+                    self._interruption_transcription_received = True
+        
+        @self.session.on("agent_state_changed")
+        def on_agent_state_changed(ev: AgentStateChangedEvent):
+            """Handle agent state changes to detect interruptions."""
+            old_state = ev.old_state
+            new_state = ev.new_state
+            self._last_agent_state = new_state
+            
+            # Detect interruption: agent was speaking, now listening (user interrupted)
+            if old_state == "speaking" and new_state == "listening":
+                self._handle_interruption()
+            # Agent resumed speaking (false interruption resolved)
+            elif old_state == "listening" and new_state == "speaking":
+                if self._interruption_start_time is not None:
+                    # Check if this was a false interruption
+                    if not self._interruption_transcription_received:
+                        self._handle_false_interruption()
+                    else:
+                        self._handle_real_interruption()
+                    self._reset_interruption_tracking()
+        
+        # Listen for false interruption event if available
+        try:
+            @self.session.on("agent_false_interruption")
+            def on_false_interruption(ev):
+                """Handle false interruption event from LiveKit."""
+                self._handle_false_interruption()
+                self._reset_interruption_tracking()
+        except AttributeError:
+            # Event might not be available, we'll handle it via state changes
+            pass
+    
+    def _handle_interruption(self):
+        """Handle when agent is interrupted by user."""
+        self._interruption_start_time = time.time()
+        self._interruption_transcription_received = False
+        self._agent_was_speaking = True
+        
+        # Start checking for false interruption after timeout
+        false_interruption_timeout = 2.0  # Default, can be configured
+        self._false_interruption_check_task = asyncio.create_task(
+            self._check_false_interruption(false_interruption_timeout)
+        )
+        
+        logger.info("Agent interrupted by user")
+    
+    async def _check_false_interruption(self, timeout: float):
+        """Check if interruption was false (no transcription received)."""
+        await asyncio.sleep(timeout)
+        
+        if self._interruption_start_time is not None and not self._interruption_transcription_received:
+            # No transcription received within timeout - likely false interruption
+            self._handle_false_interruption()
+            self._reset_interruption_tracking()
+    
+    def _handle_false_interruption(self):
+        """Handle false interruption (no actual user speech)."""
+        interruption_duration = (
+            time.time() - self._interruption_start_time
+            if self._interruption_start_time
+            else 0.0
+        )
+        
+        self.stats["false_interruptions"] += 1
+        
+        event = {
+            "timestamp": time.time(),
+            "type": "false_interruption",
+            "duration": interruption_duration,
+            "language": self.rules.language,
+        }
+        self.stats["interruptions"].append(event)
+        
+        logger.info(
+            f"False interruption detected (duration: {interruption_duration:.2f}s, "
+            f"language: {self.rules.language})"
+        )
+    
+    def _handle_real_interruption(self):
+        """Handle real interruption (user actually spoke)."""
+        interruption_duration = (
+            time.time() - self._interruption_start_time
+            if self._interruption_start_time
+            else 0.0
+        )
+        
+        event = {
+            "timestamp": time.time(),
+            "type": "real_interruption",
+            "duration": interruption_duration,
+            "language": self.rules.language,
+        }
+        self.stats["interruptions"].append(event)
+        
+        # Keep only recent interruptions (last 50)
+        if len(self.stats["interruptions"]) > 50:
+            self.stats["interruptions"] = self.stats["interruptions"][-50:]
+        
+        logger.info(
+            f"Real interruption detected (duration: {interruption_duration:.2f}s, "
+            f"language: {self.rules.language})"
+        )
+    
+    def _reset_interruption_tracking(self):
+        """Reset interruption tracking state."""
+        self._interruption_start_time = None
+        self._interruption_transcription_received = False
+        self._agent_was_speaking = False
+        if self._false_interruption_check_task:
+            self._false_interruption_check_task.cancel()
+            self._false_interruption_check_task = None
     
     async def _handle_silence_start(self):
         """Called when user stops speaking - apply cultural timing."""
@@ -380,12 +525,23 @@ class SilenceModelingEngine:
             else 0.0
         )
         
+        real_interruptions = [
+            i for i in self.stats["interruptions"] if i.get("type") == "real_interruption"
+        ]
+        false_interruptions = [
+            i for i in self.stats["interruptions"] if i.get("type") == "false_interruption"
+        ]
+        
         return {
             "language": self.rules.language,
             "total_silence_events": len(self.stats["silence_events"]),
             "backchannels_triggered": self.stats["backchannels_triggered"],
             "total_responses": len(self.stats["response_delays"]),
             "avg_response_delay": avg_response_delay,
+            "total_interruptions": len(self.stats["interruptions"]),
+            "real_interruptions": len(real_interruptions),
+            "false_interruptions": self.stats["false_interruptions"],
             "recent_silence_events": self.stats["silence_events"][-10:],  # Last 10
+            "recent_interruptions": self.stats["interruptions"][-10:],  # Last 10
         }
 
