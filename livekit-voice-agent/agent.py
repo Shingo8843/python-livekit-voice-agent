@@ -8,6 +8,12 @@ from livekit.agents import AgentServer, AgentSession, Agent, room_io
 from livekit.plugins import noise_cancellation, silero, deepgram, openai, cartesia
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+try:
+    from .model import get_conversational_config
+except ImportError:
+    # Fallback for when running as script
+    from model import get_conversational_config
+
 logger = logging.getLogger(__name__)
 load_dotenv(".env.local")
 instructions = """You are a helpful voice AI assistant. 
@@ -29,14 +35,17 @@ async def my_agent(ctx: agents.JobContext):
     # In production, this would come from your Call Pack
     language = os.getenv("AGENT_LANGUAGE", "en-US")
     
-    # Configure session timing parameters
-    # For Japanese: more conservative interruption handling
-    # For English: more tolerant interruption handling
-    false_interruption_timeout = 2.5 if language.startswith("ja") else 2.0
-    resume_false_interruption = True  # Resume after false interruption
-    min_interruption_duration = 0.8 if language.startswith("ja") else 0.3
-    min_response_delay = 0.2 if language.startswith("ja") else 0.05
-    
+    # Get conversational design configuration based on language
+    conversational_config = get_conversational_config(
+        language,
+        use_turn_detector=True,
+        preemptive_generation=os.getenv("PREEMPTIVE_GENERATION", "false").lower() == "true",
+        user_away_timeout=float(os.getenv("USER_AWAY_TIMEOUT", "15.0")) if os.getenv("USER_AWAY_TIMEOUT") else None,
+    )
+    # TTS parameters - can be overridden via environment variables
+    tts_speed = float(os.getenv("TTS_SPEED", "1.0"))
+    tts_volume = float(os.getenv("TTS_VOLUME", "1.0"))
+    tts_emotion = os.getenv("TTS_EMOTION", "calm" if language.startswith("ja") else "friendly")
     # Configure STT - Use Deepgram plugin with your own API key
     deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     if not deepgram_api_key:
@@ -79,11 +88,6 @@ async def my_agent(ctx: agents.JobContext):
     
     logger.info("Cartesia API key found, using Cartesia plugin")
     
-    # TTS parameters - can be overridden via environment variables
-    tts_speed = float(os.getenv("TTS_SPEED", "1.0"))
-    tts_volume = float(os.getenv("TTS_VOLUME", "1.0"))
-    tts_emotion = os.getenv("TTS_EMOTION", "calm" if language.startswith("ja") else "friendly")
-    
     # TTS configuration - Cartesia with language and voice parameters
     try:
         tts = cartesia.TTS(
@@ -119,19 +123,13 @@ async def my_agent(ctx: agents.JobContext):
         logger.error(f"Failed to initialize OpenAI LLM: {e}")
         raise
     
+    # Create AgentSession with language-appropriate conversational configuration
     session = AgentSession(
         stt=stt,
         llm=llm,
         tts=tts,
         vad=silero.VAD.load(),
-        turn_detection=MultilingualModel(),
-        # Apply cultural timing rules
-        min_endpointing_delay=min_response_delay,
-        allow_interruptions=True,  # Always allow, but control via cultural rules
-        min_interruption_duration=min_interruption_duration,
-        min_interruption_words=2,  # Require at least one word for interruption
-        false_interruption_timeout=false_interruption_timeout,
-        resume_false_interruption=resume_false_interruption,
+        **conversational_config.to_dict(),
     )
 
     await session.start(
