@@ -1,0 +1,33 @@
+{
+  "en": {
+    "carrier_brand": "Fast Logistics",
+    "logistics_company": "Global Shipping Solutions",
+    "agent_name": "Sarah",
+    "store_name": "Downtown Retail Center",
+    "delivery_date": "2024-01-15",
+    "window_start": "09:00",
+    "window_end": "17:00",
+    "confirmed_time": "14:00",
+    "new_confirmed_time": "15:00",
+    "po_number": "PO-12345",
+    "pallet_count": "5",
+    "truck_type": "box truck",
+    "receiver_name": "John Smith"
+  },
+  "ja": {
+    "carrier_brand": "スピード物流",
+    "logistics_company": "グローバル配送サービス",
+    "agent_name": "ヤマダ",
+    "store_name": "新宿店",
+    "delivery_date": "2024-01-15",
+    "window_start": "09:00",
+    "window_end": "17:00",
+    "confirmed_time": "14:00",
+    "new_confirmed_time": "15:00",
+    "po_number": "PO-12345",
+    "pallet_count": "5",
+    "truck_type": "トラック",
+    "receiver_name": "タナカ タロウ"
+  }
+}
+

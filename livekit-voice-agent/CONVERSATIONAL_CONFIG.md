@@ -458,6 +458,117 @@ session = AgentSession(
 
 ---
 
+## Backchannel Handling
+
+### Overview
+
+Backchannels are short words or phrases (like "uh-huh", "yeah", "I see", "はい") that users say to show they're listening without actually interrupting. By default, these can trigger interruptions, causing the agent to stop speaking unnecessarily.
+
+### Built-in Options
+
+**LiveKit Agents does not have a built-in parameter to configure backchannel words.** However, you have several options:
+
+#### 1. Use `min_interruption_words`
+
+Setting `min_interruption_words=2` or higher helps filter out single-word backchannels, but this is not specific to backchannels and may also filter legitimate short interruptions.
+
+```python
+session = AgentSession(
+    min_interruption_words=2,  # Require at least 2 words
+    # ... other config
+)
+```
+
+#### 2. Use Realtime LLM Models
+
+Realtime models like **OpenAI Realtime API** with **Semantic VAD** have better semantic understanding and may better distinguish backchannels from real interruptions:
+
+```python
+from livekit.plugins.openai import realtime
+from openai.types.beta.realtime.session import TurnDetection
+
+session = AgentSession(
+    llm=realtime.RealtimeModel(
+        turn_detection=TurnDetection(
+            type="semantic_vad",  # Better at detecting backchannels
+            eagerness="auto",
+        )
+    ),
+)
+```
+
+**Note:** Semantic VAD doesn't explicitly detect backchannels, but it's generally better at understanding context and may be less likely to treat backchannels as interruptions.
+
+#### 3. Custom Backchannel Filtering (Recommended)
+
+Implement custom event handlers to filter backchannels. Use the `backchannel_filter.py` module:
+
+```python
+from backchannel_filter import setup_backchannel_filtering
+
+# After creating session
+session = AgentSession(...)
+
+# Set up backchannel filtering
+backchannel_filter = setup_backchannel_filtering(
+    session,
+    language="en-US",  # or "ja-JP"
+    prevent_interruption=True,
+)
+```
+
+**How it works:**
+- Monitors `user_input_transcribed` events
+- Detects common backchannel words/phrases
+- Logs backchannels for monitoring
+- Works with `min_interruption_words` to reduce false interruptions
+
+**Supported Languages:**
+- English: "uh-huh", "yeah", "mm-hmm", "okay", "right", "I see", etc.
+- Japanese: "はい", "ええ", "そうですね", "なるほど", etc.
+
+**Limitations:**
+- Cannot directly prevent interruptions (LiveKit's interruption logic runs before event handlers)
+- Works best when combined with `min_interruption_words=2` or higher
+- Backchannels are logged but may still trigger brief pauses
+
+### Best Practices
+
+1. **Combine approaches**: Use `min_interruption_words=2` + backchannel filtering + appropriate `min_interruption_duration`
+2. **Language-specific**: Different languages have different backchannel patterns
+3. **Monitor logs**: Check backchannel detection logs to tune your configuration
+4. **Test with real users**: Backchannel behavior varies by individual and context
+
+### Example Configuration
+
+```python
+from model import get_conversational_config
+from backchannel_filter import setup_backchannel_filtering
+
+language = "en-US"
+
+# Get conversational config
+config = get_conversational_config(
+    language,
+    use_turn_detector=True,
+)
+
+# Create session with higher min_interruption_words to filter backchannels
+session = AgentSession(
+    stt=stt,
+    llm=llm,
+    tts=tts,
+    vad=vad,
+    min_interruption_words=2,  # Filter single-word backchannels
+    **config.to_dict(),
+)
+
+# Set up backchannel filtering
+setup_backchannel_filtering(session, language=language)
+```
+
+---
+
 ## Additional Resources
 
 - [LiveKit Agents Documentation - Turn Detection](https://docs.livekit.io/agents/build/turns/)
