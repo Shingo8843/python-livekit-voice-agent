@@ -1,312 +1,351 @@
-1. High-Level Architecture
+# Python LiveKit Voice Agent
 
-The system is composed of the following modules:
+A multilingual voice AI agent built on LiveKit Agents framework, designed for delivery appointment scheduling and logistics coordination. The agent supports English and Japanese with culturally-appropriate conversational behaviors.
 
-LiveKit Transport Layer
-Manages calls, audio streams, playback, connection, and termination signals.
+---
 
-Conversation Engine
-Controls call flow, manages turn-taking, silence interpretation, and step progression.
+## What This Agent Does
 
-Template Prompting + Variable Injection Layer
-Inserts operational variables into fixed conversation templates.
-Ensures deterministic responses and predictable agent behavior.
+This voice agent handles **outbound phone calls for delivery appointment management**. It can:
 
-Rule-Based Response Layer
-Handles operational questions such as quantity, damage, or shipment status.
-Avoids relying on general LLM reasoning.
+- **Schedule new delivery appointments** - Propose delivery dates and time windows, confirm availability
+- **Modify existing appointments** - Change delivery times within allowed windows
+- **Cancel appointments** - Handle cancellation requests with confirmation
+- **Confirm appointments** - Verify scheduled delivery details
 
-Cultural Intelligence Layer
-Adjusts prosody, timing, silence tolerance, backchannel frequency, and pacing.
+The agent is designed to work with receiving departments managing logistics coordination calls with a professional, friendly tone.
 
-ASR / LLM / TTS Services
-Provides streaming transcription, constrained text generation, and audio output.
+---
 
-Call Scheduler
-Defines retry logic, business hour rules, and voicemail detection.
+## Currently Implemented
 
-Logging and Post-Call Output
-Creates final transcripts and a structured call summary.
+### Core Infrastructure ✅
 
-No translation module is included.
+1. **LiveKit Agent Framework**
 
-2. Data Model: Call Pack
+   - Full integration with LiveKit Agents SDK
+   - AgentServer and AgentSession setup
+   - Real-time audio streaming and processing
+   - Room I/O with noise cancellation support
 
-All operational input is preprocessed before the call begins.
-The system extracts and stores the variables needed for the entire call.
+2. **Speech Services Integration**
 
-Call Pack Example
+   - **STT (Speech-to-Text)**: Deepgram with language-specific models
+     - English: `flux-general-en` model
+     - Japanese: `nova-general-ja` model
+   - **LLM**: OpenAI GPT-4.1 for conversation generation
+   - **TTS (Text-to-Speech)**: Cartesia Sonic-3 with language-specific voices
+     - Configurable speed, volume, and emotion parameters
+   - **VAD (Voice Activity Detection)**: Silero VAD for speech detection
 
-{
-  language: "ja-JP",
-  orderId: "59127",
-  productName: "PowerCraft Pro 300",
-  cartons: 4,
-  pickupTime: "16:00",
-  damageDescription: "2 cm dent on the corner",
-  requiresShipmentConfirmation: true
-}
+3. **Language Support**
 
+   - **English (en-US)**: Full support with optimized conversational parameters
+   - **Japanese (ja-JP)**: Full support with culturally-appropriate timing
 
-The Call Pack is stable and immutable during the call.
+4. **Template-Based Prompting System**
 
-3. Template-Based Prompting Model
+   - Language-specific prompt files (`prompt_en.txt`, `prompt_ja.txt`)
+   - Variable injection from JSON configuration (`prompt_variables.json`)
+   - Dynamic variable substitution (e.g., `{{delivery_date}}`, `{{agent_name}}`)
+   - Supports delivery appointment workflows with detailed instructions
 
-The entire conversation uses predefined templates:
+5. **Cultural Conversational Configuration**
 
-Introduction template
+   - Language-specific turn detection and timing parameters
+   - **Japanese settings**:
+     - Longer interruption duration (0.8s)
+     - More conservative endpointing delays (0.2-4.0s)
+     - Requires 2+ words for interruption
+   - **English settings**:
+     - Faster response times (0.05-3.0s)
+     - More responsive interruptions (0.3s, 1 word)
+   - Multilingual turn detector model for context-aware turn detection
+
+6. **Function Tools**
+
+   - `get_current_time()` - Provides current date and time
+   - `search_knowledge_base()` - Placeholder for knowledge base queries
+   - `hang_up()` - Gracefully ends calls with goodbye messages
+
+7. **Configuration Management**
+
+   - Environment variable support (`.env.local`)
+   - Configurable TTS parameters (speed, volume, emotion)
+   - Language selection via `AGENT_LANGUAGE` environment variable
+   - Optional preemptive generation and user away timeout
+
+8. **Noise Cancellation**
+   - Automatic noise cancellation for telephony calls (BVCTelephony)
+   - Standard noise cancellation for regular participants (BVC)
+
+---
+
+## What It Does NOT Do Yet (Future Implementation)
+
+The following features are planned but not yet implemented:
+
+### 1. Call Pack Data Model ❌
+
+- **Status**: Not implemented
+- **Planned**: Structured data model to preprocess and store all call variables before the call begins
+- **Example structure**:
+  ```json
+  {
+    "language": "ja-JP",
+    "orderId": "59127",
+    "deliveryDate": "2024-01-15",
+    "windowStart": "09:00",
+    "windowEnd": "17:00",
+    "poNumber": "PO-12345",
+    "palletCount": 5,
+    "truckType": "box truck"
+  }
+  ```
+
+### 2. Call Scheduler ❌
+
+- **Status**: Not implemented
+- **Planned**: Automated call scheduling and retry logic
+- **Features**:
+  - Up to 3 retry attempts
+  - 1 hour delay between attempts
+  - Voicemail detection via energy pattern analysis
+  - Business hours enforcement
+  - Attempt logging with timestamps
+
+### 3. Advanced Silence Modeling Engine ❌
+
+- **Status**: Partially implemented (basic timing parameters exist)
+- **Planned**: Sophisticated silence analysis
+- **Features**:
+  - Distinguish between normal pauses, thinking, end of speech, disengagement
+  - Context-aware silence interpretation
+  - Automatic backchannel generation
+  - Prevent unintentional interruptions
+
+### 4. Cultural Intelligence Layer ❌
+
+- **Status**: Partially implemented (TTS emotion settings exist)
+- **Planned**: Advanced prosody and pacing adjustments
+- **Features**:
+  - Text transformation before TTS
+  - Natural pause insertion
+  - Culturally-appropriate intonation patterns
+  - Sentence ending modifications
+  - Acknowledgement phrase insertion
+
+### 5. Structured Call Logging and Post-Call Output ❌
+
+- **Status**: Not implemented
+- **Planned**: Comprehensive call analytics
+- **Features**:
+  - Final transcript generation
+  - Structured call summary (JSON format)
+  - Extracted conversation variables
+  - Call status records (success, no answer, voicemail, etc.)
+  - Storage integration (S3 or database)
+  - 90-day log retention
+  - Call ID and Order ID as primary keys
+
+### 6. Conversation State Machine ❌
+
+- **Status**: Not implemented
+- **Planned**: Explicit state management for call flow
+- **States**:
+  - Call Initiated
+  - Introduction Delivered
+  - Information Presented
+  - Awaiting Response
+  - Handling Questions
+  - Confirming Next Steps
+  - Closing
+  - Ending Call
+
+### 7. Template-Based Conversation Flow ❌
+
+- **Status**: Partially implemented (prompt templates exist, but not strict flow control)
+- **Planned**: Strict template-based conversation with fixed scripts
+- **Features**:
+  - Introduction template
+  - Information delivery template
+  - Confirmation request template
+  - Clarification templates
+  - Closing template
+  - Error fallback templates
+
+### 8. Advanced Observability ❌
+
+- **Status**: Basic logging exists
+- **Planned**: Comprehensive metrics and monitoring
+- **Features**:
+  - Silence duration tracking
+  - Response timing metrics
+  - Turn-taking behavior analysis
+  - Template usage statistics
+  - Rule-based response trigger logging
+  - Performance dashboards
+
+---
+
+## Technical Architecture
+
+### Current Stack
+
+- **Framework**: LiveKit Agents SDK v1.2+
+- **Python**: 3.12+
+- **STT**: Deepgram (flux-general-en, nova-general-ja)
+- **LLM**: OpenAI GPT-4.1
+- **TTS**: Cartesia Sonic-3
+- **VAD**: Silero
+- **Noise Cancellation**: BVC/BVCTelephony
+
+### Project Structure
+
+```
+livekit-voice-agent/
+├── agent.py              # Main agent server and session setup
+├── model.py              # Conversational configuration models
+├── tools.py              # Function tools for the agent
+├── prompt_en.txt        # English prompt template
+├── prompt_ja.txt        # Japanese prompt template
+├── prompt_variables.json # Variable substitution data
+├── pyproject.toml       # Project dependencies
+└── CONVERSATIONAL_CONFIG.md # Detailed configuration guide
+```
+
+---
+
+## Setup and Configuration
+
+### Prerequisites
+
+1. Python 3.12 or higher
+2. LiveKit account and credentials
+3. API keys for:
+   - Deepgram (STT)
+   - OpenAI (LLM)
+   - Cartesia (TTS)
+
+### Installation
+
+```bash
+# Install dependencies
+pip install -e .
+
+# Or using uv
+uv pip install -e .
+```
+
+### Environment Variables
 
-Information delivery template
+Create a `.env.local` file with:
 
-Confirmation request template
+```env
+# Required
+DEEPGRAM_API_KEY=your_deepgram_key
+OPENAI_API_KEY=your_openai_key
+CARTESIA_API_KEY=your_cartesia_key
 
-Clarification templates
+# Optional
+AGENT_LANGUAGE=en-US  # or ja-JP
+TTS_SPEED=1.0
+TTS_VOLUME=1.0
+TTS_EMOTION=friendly  # or calm for Japanese
+PREEMPTIVE_GENERATION=false
+USER_AWAY_TIMEOUT=15.0
+```
 
-Closing template
+### Running the Agent
 
-Error fallback templates
+```bash
+# Using LiveKit CLI
+livekit-agents dev
 
-Variables from the Call Pack are injected into slots in the templates.
+# Or directly
+python -m livekit_voice_agent.agent
+```
 
-Technical Goals
+---
 
-Reduce LLM creativity
+## Configuration Details
 
-Ensure predictable operational output
+### Conversational Parameters
 
-Prevent hallucination
+The agent uses language-specific conversational configurations that control:
 
-Maintain consistent tone and politeness
+- **Turn Detection**: Multilingual model for context-aware turn detection
+- **Interruption Handling**: Duration and word count thresholds
+- **Endpointing**: Minimum/maximum delays before responding
+- **User State**: Away timeout detection
+- **Tool Calls**: Maximum tool execution steps
 
-Speed up response generation
+See `CONVERSATIONAL_CONFIG.md` for detailed parameter documentation.
 
-Only short, controlled text blocks are generated during the call.
+### Prompt Variables
 
-4. Conversation Engine
+Edit `prompt_variables.json` to customize:
 
-The Conversation Engine is the orchestrator, controlling:
+- Carrier brand name
+- Logistics company name
+- Agent name
+- Store name
+- Delivery dates and times
+- PO numbers, pallet counts, truck types
 
-Call flow state
+Variables are automatically injected into prompt templates using `{{variable_name}}` syntax.
 
-Turn-taking
+---
 
-Silence analysis
+## Future Roadmap
 
-Backchannel generation
+### Phase 1: Core Operational Features
 
-Determining when to speak or wait
+- [ ] Implement Call Pack data model
+- [ ] Build rule-based response layer
+- [ ] Add conversation state machine
 
-Handing off queries to the rule-based layer
+### Phase 2: Call Management
 
-Injecting template output into TTS
+- [ ] Implement call scheduler with retry logic
+- [ ] Add voicemail detection
+- [ ] Business hours enforcement
 
-Conversation States
+### Phase 3: Advanced Intelligence
 
-Call Initiated
+- [ ] Enhanced silence modeling engine
+- [ ] Full cultural intelligence layer
+- [ ] Template-based conversation flow control
 
-Introduction Delivered
+### Phase 4: Analytics and Observability
 
-Information Presented
+- [ ] Structured call logging
+- [ ] Post-call summary generation
+- [ ] Performance metrics and dashboards
+- [ ] Storage integration (S3/database)
 
-Awaiting Response
+---
 
-Handling Questions
+## Contributing
 
-Confirming Next Steps
+This project is actively under development. Contributions are welcome for:
 
-Closing
+- Implementing planned features
+- Improving cultural conversational behaviors
+- Adding support for additional languages
+- Enhancing error handling and reliability
 
-Ending Call
+---
 
-State transitions are predictable because the script is fixed.
+## License
 
-5. Silence Modeling Engine
+[Add your license information here]
 
-Even with templates, silence behavior must reflect the target culture.
+---
 
-Responsibilities
+## References
 
-Monitor audio energy and ASR timing to detect silence
-
-Distinguish between:
-
-normal pause
-
-thinking
-
-end of speech
-
-disengagement
-
-Control when the agent speaks
-
-Trigger supportive backchannels
-
-Prevent unintentional interruptions
-
-Cultural Timing Rules
-
-Japanese
-
-Minimum delay before responding: 200–500 ms
-
-Long silences tolerated
-
-Backchannels frequent but soft
-
-No immediate overlap
-
-English
-
-Minimum delay: 50–150 ms
-
-Silences are minimized
-
-Backchannels less frequent
-
-Slight overlap acceptable
-
-The timing rules are configurable but follow these defaults.
-
-6. Cultural Intelligence Layer
-
-This layer transforms text before sending it to TTS.
-
-Adaptations
-
-Adjust pacing
-
-Modify sentence endings
-
-Insert natural pauses
-
-Smooth intonation patterns
-
-Add culturally appropriate acknowledgement phrases
-
-Ensure no English-style stress appears in Japanese speech
-
-Ensure no overly indirect phrasing appears in English speech
-
-This layer does not change the meaning, only the delivery.
-
-7. Rule-Based Response Layer
-
-The system must answer real questions reliably without relying on LLM reasoning.
-
-Example rules
-
-If user asks about carton quantity:
-Return callPack.cartons.
-
-If user asks about damage:
-Return callPack.damageDescription.
-
-If user asks about weight or missing info:
-Return
-“ I do not have that information. I will check.”
-
-If user asks whether shipment is possible:
-Return
-“ Please let me know whether shipment will be possible after the inspection.”
-
-This keeps operational accuracy extremely high.
-
-8. ASR, LLM, and TTS Services
-ASR Requirements
-
-Streaming transcription
-
-Partial and final segments
-
-Timestamps for silence modeling
-
-Fast turnaround for low latency
-
-LLM Requirements
-
-Constrained prompt structure
-
-No free-form creativity
-
-Ability to generate short, polite phrases
-
-Obey template boundaries
-
-React deterministically based on Call Pack
-
-TTS Requirements
-
-Accept pacing and pause hints
-
-Support Japanese mora timing or English stress timing
-
-Natural prosody at low latency
-
-No mispronunciation of variable values
-
-9. Call Scheduler
-
-Enforces operational rules:
-
-Up to 3 attempts
-
-1 hour between attempts
-
-No voicemail
-
-Detect voicemail through energy patterns
-
-Respect local business hours
-
-Log each attempt with timestamps
-
-10. Logging and Post-Call Output
-
-After each call:
-
-Outputs Provided
-
-Final transcript (single-language)
-
-A structured call summary
-
-Extracted variables used in the conversation
-
-Call status record (success, no answer, voicemail blocked, etc.)
-
-Storage
-
-Retain logs for 90 days
-
-Store in S3 or a database
-
-Use callId and orderId as primary keys
-
-11. Non-Functional Requirements
-Latency Target
-
-End-to-end (ASR → LLM → TTS → playback)
-200–400 ms maximum.
-
-Reliability
-
-Auto-reconnect for streaming services
-
-Conversation must gracefully continue after intermittent ASR/TTS delay
-
-Observability
-
-Log:
-
-Silence durations
-
-Response timing
-
-Turn-taking behavior
-
-Template usage
-
-Rule-based response triggers
-
-These logs enable continuous tuning of the cultural timing model.
+- [LiveKit Agents Documentation](https://docs.livekit.io/agents/)
+- [LiveKit Conversational Design Guide](https://docs.livekit.io/agents/conversational-design/)
+- [Deepgram API Documentation](https://developers.deepgram.com/)
+- [Cartesia API Documentation](https://docs.cartesia.ai/)
