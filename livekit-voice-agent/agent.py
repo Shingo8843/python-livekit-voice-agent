@@ -156,17 +156,15 @@ async def my_agent(ctx: agents.JobContext):
     logger.info("Deepgram API key found, using Deepgram plugin")
     try:
         if language.startswith("ja"):
-            # For Japanese: Deepgram requires model names with exactly 3 parts separated by hyphens
-            # Format: {model}-{domain}-{language}
-            # Since nova-3 has a hyphen, we use "nova" for the 3-part format
-            # Alternative: use "nova-3" alone (default model) - but API requires 3-part format
-            stt = deepgram.STTv2(
-                model="nova-general-ja",  # 3 parts: nova, general, ja
+            # For Japanese: Use nova-3 model (Deepgram's latest model)
+            stt = deepgram.STT(
+                model="nova-3",
+                language="ja",
             )
             tts_language = "ja"
-            logger.info("Using Deepgram nova-general-ja model for Japanese")
+            logger.info("Using Deepgram nova-3 model for Japanese")
         else:
-            # Use flux model for English - model name format: {model}-{domain}-{language}
+            # Use flux model for English - can use simple model name or 3-part format
             stt = deepgram.STTv2(
                 model="flux-general-en",  # 3 parts: flux, general, en
             )
