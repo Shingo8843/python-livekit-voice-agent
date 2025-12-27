@@ -1,7 +1,7 @@
 [project]
 name = "livekit-voice-agent"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "livekit-agents[silero,turn-detector,deepgram,openai,cartesia]~=1.2",
     "livekit-plugins-noise-cancellation~=0.2",

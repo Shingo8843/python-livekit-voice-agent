@@ -193,7 +193,7 @@ The following features are planned but not yet implemented:
 ### Current Stack
 
 - **Framework**: LiveKit Agents SDK v1.2+
-- **Python**: 3.12+
+- **Python**: 3.12 or 3.13 (3.14 not supported due to dependency limitations)
 - **STT**: Deepgram (flux-general-en, nova-general-ja)
 - **LLM**: OpenAI GPT-4.1
 - **TTS**: Cartesia Sonic-3
@@ -220,7 +220,7 @@ livekit-voice-agent/
 
 ### Prerequisites
 
-1. Python 3.12 or higher
+1. Python 3.12 or 3.13 (3.14 is not supported due to `livekit-blingfire` dependency limitations)
 2. LiveKit account and credentials
 3. API keys for:
    - Deepgram (STT)
