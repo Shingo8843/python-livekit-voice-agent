@@ -216,17 +216,188 @@ The following features are planned but not yet implemented:
 ### Current Stack
 
 - **Framework**: LiveKit Agents SDK v1.2+
-<<<<<<< Updated upstream
-- **Python**: 3.12 or 3.13 (3.14 not supported due to dependency limitations)
-- **STT**: Deepgram (flux-general-en, nova-general-ja)
-=======
 - **Python**: 3.12+
 - **STT**: Deepgram (flux-general-en, nova-3)
->>>>>>> Stashed changes
 - **LLM**: OpenAI GPT-4.1
 - **TTS**: ElevenLabs (preferred) or Cartesia (fallback)
 - **VAD**: Silero
 - **Noise Cancellation**: BVC/BVCTelephony
+
+### Architecture Diagrams
+
+#### System Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "Call Initiation"
+        SIP[SIP Phone Call] --> LiveKit[LiveKit Server]
+        Web[Web Client] --> LiveKit
+    end
+    
+    subgraph "LiveKit Agent Server"
+        AgentServer[AgentServer] --> AgentSession[AgentSession]
+        AgentSession --> STT[STT Engine<br/>Deepgram]
+        AgentSession --> LLM[LLM Engine<br/>OpenAI GPT-4.1]
+        AgentSession --> TTS[TTS Engine<br/>ElevenLabs/Cartesia]
+        AgentSession --> VAD[VAD<br/>Silero]
+        AgentSession --> NoiseCancel[Noise Cancellation<br/>BVC/BVCTelephony]
+    end
+    
+    subgraph "Agent Components"
+        AgentSession --> Assistant[Assistant Agent]
+        Assistant --> Tools[Function Tools<br/>get_current_time<br/>search_knowledge_base<br/>hang_up]
+        Assistant --> Prompts[Prompt Templates<br/>prompt_en.txt<br/>prompt_ja.txt]
+        Prompts --> Variables[Prompt Variables<br/>prompt_variables.json]
+    end
+    
+    subgraph "Configuration"
+        Config[Conversational Config<br/>model.py] --> AgentSession
+        Config --> LangConfig[Language-Specific Settings<br/>Japanese: Conservative<br/>English: Responsive]
+    end
+    
+    LiveKit <--> AgentServer
+    AgentSession --> LiveKit
+    
+    style AgentServer fill:#e1f5ff
+    style AgentSession fill:#b3e5fc
+    style STT fill:#fff9c4
+    style LLM fill:#fff9c4
+    style TTS fill:#fff9c4
+    style Assistant fill:#c8e6c9
+```
+
+#### Call Flow Architecture
+
+```mermaid
+sequenceDiagram
+    participant Caller as Overseas Partner<br/>(Phone/Web)
+    participant LiveKit as LiveKit Server
+    participant Agent as Agent Server
+    participant STT as Deepgram STT
+    participant VAD as Silero VAD
+    participant LLM as OpenAI GPT-4.1
+    participant TTS as ElevenLabs/Cartesia
+    participant Tools as Function Tools
+    
+    Caller->>LiveKit: Initiate Call
+    LiveKit->>Agent: Create AgentSession
+    Agent->>Agent: Load Language Config
+    Agent->>Agent: Load Prompt Template
+    Agent->>Agent: Initialize STT/TTS/LLM
+    
+    Agent->>TTS: Generate Greeting
+    TTS->>Caller: "Hello, this is..."
+    
+    loop Conversation Loop
+        Caller->>LiveKit: Audio Stream
+        LiveKit->>Agent: Audio Frames
+        Agent->>NoiseCancel: Process Audio
+        NoiseCancel->>VAD: Detect Speech
+        VAD->>STT: Transcribe Speech
+        STT->>Agent: Text Transcript
+        
+        Agent->>LLM: Process with Context
+        LLM->>LLM: Generate Response
+        LLM->>Tools: Call Function (if needed)
+        Tools->>LLM: Return Result
+        
+        LLM->>Agent: Response Text
+        Agent->>TTS: Convert to Speech
+        TTS->>Caller: Audio Response
+    end
+    
+    Agent->>Tools: hang_up()
+    Tools->>TTS: Goodbye Message
+    TTS->>Caller: "Thank you, goodbye"
+    Agent->>Agent: Shutdown & Log
+```
+
+#### Component Interaction Diagram
+
+```mermaid
+graph LR
+    subgraph "Input Processing"
+        Audio[Audio Input] --> NC[Noise Cancellation]
+        NC --> VAD[VAD Detection]
+        VAD --> STT[Speech-to-Text]
+    end
+    
+    subgraph "Core Agent"
+        STT --> Session[AgentSession]
+        Session --> TurnDetect[Turn Detection<br/>MultilingualModel]
+        Session --> Endpoint[Endpointing Logic]
+        Session --> Interrupt[Interruption Handler]
+    end
+    
+    subgraph "Language Processing"
+        Session --> LLM[LLM Processing]
+        LLM --> Prompt[Prompt Template<br/>+ Variables]
+        LLM --> Tools[Function Tools]
+        Tools --> Session
+    end
+    
+    subgraph "Output Generation"
+        LLM --> Response[Response Text]
+        Response --> TTS[Text-to-Speech]
+        TTS --> AudioOut[Audio Output]
+    end
+    
+    subgraph "Configuration"
+        LangConfig[Language Config<br/>Japanese/English] --> Session
+        ConvConfig[Conversational Params<br/>Timing, Interruptions] --> Session
+    end
+    
+    AudioOut --> Audio
+    
+    style Session fill:#e1f5ff
+    style LLM fill:#fff9c4
+    style LangConfig fill:#c8e6c9
+```
+
+#### Service Integration Architecture
+
+```mermaid
+graph TB
+    subgraph "LiveKit Voice Agent"
+        Agent[Agent Server<br/>Python 3.12+]
+    end
+    
+    subgraph "External AI Services"
+        Deepgram[Deepgram API<br/>STT Service<br/>- flux-general-en<br/>- nova-3]
+        OpenAI[OpenAI API<br/>GPT-4.1<br/>Conversation & Translation]
+        ElevenLabs[ElevenLabs API<br/>TTS Service<br/>Preferred]
+        Cartesia[Cartesia API<br/>TTS Service<br/>Fallback]
+    end
+    
+    subgraph "Local Processing"
+        Silero[Silero VAD<br/>Voice Activity Detection]
+        BVC[BVC/BVCTelephony<br/>Noise Cancellation]
+    end
+    
+    subgraph "Configuration Files"
+        Prompts[Prompt Templates<br/>prompt_en.txt<br/>prompt_ja.txt]
+        Variables[JSON Variables<br/>prompt_variables.json]
+        Config[Python Config<br/>model.py]
+    end
+    
+    Agent --> Deepgram
+    Agent --> OpenAI
+    Agent --> ElevenLabs
+    Agent --> Cartesia
+    Agent --> Silero
+    Agent --> BVC
+    Agent --> Prompts
+    Agent --> Variables
+    Agent --> Config
+    
+    ElevenLabs -.Fallback.-> Cartesia
+    
+    style Agent fill:#e1f5ff
+    style Deepgram fill:#fff9c4
+    style OpenAI fill:#fff9c4
+    style ElevenLabs fill:#fff9c4
+    style Cartesia fill:#ffccbc
+```
 
 ### Project Structure
 
