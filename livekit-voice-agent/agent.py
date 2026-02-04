@@ -23,15 +23,16 @@ logger = logging.getLogger(__name__)
 load_dotenv(".env.local")
 
 
-def load_prompt_variables(language: str) -> dict:
+def load_prompt_variables(language: str, additional_variables: dict | None = None) -> dict:
     """
-    Load prompt variables from JSON file based on language.
+    Load prompt variables from JSON file based on language, and merge with additional variables.
     
     Args:
         language: Language code (e.g., "en-US", "ja-JP")
+        additional_variables: Optional dictionary of additional variables to merge in
     
     Returns:
-        Dictionary of variables for the language
+        Dictionary of variables for the language, merged with additional variables
     """
     # Determine which language key to use
     lang_key = "ja" if language.startswith("ja") else "en"
@@ -45,26 +46,33 @@ def load_prompt_variables(language: str) -> dict:
             variables_data = json.load(f)
         
         # Get variables for the specific language
-        variables = variables_data.get(lang_key, {})
+        variables = variables_data.get(lang_key, {}).copy()
         logger.info(f"Loaded prompt variables for language: {lang_key}")
+        
+        # Merge with additional variables (metadata takes precedence)
+        if additional_variables:
+            variables.update(additional_variables)
+            logger.info(f"Merged {len(additional_variables)} additional variables from metadata")
+        
         return variables
     except FileNotFoundError:
         logger.warning(f"Prompt variables file not found at {variables_path}, using empty variables")
-        return {}
+        return additional_variables or {}
     except json.JSONDecodeError as e:
         logger.error(f"Error parsing JSON file {variables_path}: {e}")
-        return {}
+        return additional_variables or {}
     except Exception as e:
         logger.error(f"Error loading prompt variables: {e}")
-        return {}
+        return additional_variables or {}
 
 
-def load_prompt(language: str) -> str:
+def load_prompt(language: str, additional_variables: dict | None = None) -> str:
     """
     Load prompt file based on language and substitute variables.
     
     Args:
         language: Language code (e.g., "en-US", "ja-JP")
+        additional_variables: Optional dictionary of additional variables to merge in
     
     Returns:
         Prompt text from the appropriate file with variables substituted
@@ -85,7 +93,7 @@ def load_prompt(language: str) -> str:
         logger.info(f"Loaded prompt from {prompt_file}")
         
         # Load variables and substitute them
-        variables = load_prompt_variables(language)
+        variables = load_prompt_variables(language, additional_variables)
         if variables:
             # Replace all {{variable}} placeholders with values from JSON
             for var_name, var_value in variables.items():
@@ -125,16 +133,31 @@ server = AgentServer()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
-    # Determine language from environment or default to English
-    # In production, this would come from your Call Pack
-    language = os.getenv("AGENT_LANGUAGE", "en-US")
+    # Extract metadata from job (includes variables from Call Pack or dispatch)
+    metadata_variables = {}
+    if ctx.job.metadata:
+        try:
+            metadata_json = json.loads(ctx.job.metadata)
+            # Extract variables from metadata (e.g., agent_name, logistics_company, delivery_date, etc.)
+            metadata_variables = metadata_json
+            logger.info(f"Loaded metadata variables: {list(metadata_variables.keys())}")
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse job metadata as JSON: {ctx.job.metadata}")
+        except Exception as e:
+            logger.error(f"Error processing job metadata: {e}")
     
-    # Load prompt instructions from file based on language
-    instructions = load_prompt(language)
+    # Always use Japanese prompt for instructions, but English for STT/TTS (outbound calls)
+    prompt_language = "ja-JP"  # Use Japanese prompt file (prompt_ja.txt)
+    stt_tts_language = "en"    # Use English for actual call conversation
     
-    # Get conversational design configuration based on language
+    logger.info(f"Using Japanese prompt (prompt_ja.txt) with English STT/TTS for outbound calls")
+    
+    # Load prompt instructions from Japanese file, with metadata variables
+    instructions = load_prompt(prompt_language, additional_variables=metadata_variables)
+    
+    # Get conversational design configuration based on call language (English)
     conversational_config = get_conversational_config(
-        language,
+        "en-US",  # Use English for conversational config
         use_turn_detector=True,
         preemptive_generation=os.getenv("PREEMPTIVE_GENERATION", "false").lower() == "true",
         user_away_timeout=float(os.getenv("USER_AWAY_TIMEOUT", "15.0")) if os.getenv("USER_AWAY_TIMEOUT") else None,
@@ -142,7 +165,8 @@ async def my_agent(ctx: agents.JobContext):
     # TTS parameters - can be overridden via environment variables
     tts_speed = float(os.getenv("TTS_SPEED", "1.0"))
     tts_volume = float(os.getenv("TTS_VOLUME", "1.0"))
-    tts_emotion = os.getenv("TTS_EMOTION", "calm" if language.startswith("ja") else "friendly")
+    tts_emotion = os.getenv("TTS_EMOTION", "friendly")  # English default
+    
     # Configure STT - Use Deepgram plugin with your own API key
     deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     if not deepgram_api_key:
@@ -155,21 +179,11 @@ async def my_agent(ctx: agents.JobContext):
     
     logger.info("Deepgram API key found, using Deepgram plugin")
     try:
-        if language.startswith("ja"):
-            # For Japanese: Use nova-3 model (Deepgram's latest model)
-            stt = deepgram.STT(
-                model="nova-3",
-                language="ja",
-            )
-            tts_language = "ja"
-            logger.info("Using Deepgram nova-3 model for Japanese")
-        else:
-            # Use flux model for English - can use simple model name or 3-part format
-            stt = deepgram.STTv2(
-                model="flux-general-en",  # 3 parts: flux, general, en
-            )
-            tts_language = "en"
-            logger.info("Using Deepgram flux-general-en model for English")
+        # Always use English STT for outbound calls
+        stt = deepgram.STTv2(
+            model="flux-general-en",  # 3 parts: flux, general, en
+        )
+        logger.info("Using Deepgram flux-general-en model for English STT")
     except Exception as e:
         logger.error(f"Failed to initialize Deepgram STT: {e}")
         raise
@@ -187,16 +201,17 @@ async def my_agent(ctx: agents.JobContext):
     logger.info("Cartesia API key found, using Cartesia plugin")
     
     # TTS configuration - Cartesia with language and voice parameters
+    # Always use English TTS for outbound calls
     try:
         tts = cartesia.TTS(
             model="sonic-3",
             voice="0834f3df-e650-4766-a20c-5a93a43aa6e3",
-            language=tts_language,
+            language=stt_tts_language,  # English
             speed=tts_speed,
             volume=tts_volume,
             emotion=tts_emotion,
         )
-        logger.info(f"Using Cartesia TTS (model: sonic-3, language: {tts_language})")
+        logger.info(f"Using Cartesia TTS (model: sonic-3, language: {stt_tts_language})")
     except Exception as e:
         logger.error(f"Failed to initialize Cartesia TTS: {e}")
         raise
