@@ -14,10 +14,14 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 try:
     from .model import get_conversational_config
     from .tools import ALL_TOOLS
+    from .failure_tolerance import FailureTolerantExecutor, RetryConfig, ErrorCategory
+    from .escalation import EscalationManager, EscalationPolicy, UncertaintyHandler
 except ImportError:
     # Fallback for when running as script
     from model import get_conversational_config
     from tools import ALL_TOOLS
+    from failure_tolerance import FailureTolerantExecutor, RetryConfig, ErrorCategory
+    from escalation import EscalationManager, EscalationPolicy, UncertaintyHandler
 
 logger = logging.getLogger(__name__)
 load_dotenv(".env.local")
@@ -178,15 +182,28 @@ async def my_agent(ctx: agents.JobContext):
         raise ValueError("DEEPGRAM_API_KEY is required. Please set it in your .env.local file.")
     
     logger.info("Deepgram API key found, using Deepgram plugin")
-    try:
+    # Initialize STT with failure tolerance
+    executor = FailureTolerantExecutor(
+        retry_config=RetryConfig(max_attempts=2, initial_delay=1.0)
+    )
+    
+    async def init_stt():
         # Always use English STT for outbound calls
-        stt = deepgram.STTv2(
-            model="flux-general-en",  # 3 parts: flux, general, en
-        )
-        logger.info("Using Deepgram flux-general-en model for English STT")
-    except Exception as e:
-        logger.error(f"Failed to initialize Deepgram STT: {e}")
-        raise
+        return deepgram.STTv2(model="flux-general-en")
+    
+    stt_result = await executor.execute(
+        operation=init_stt,
+        service_name="deepgram_stt_init",
+        operation_name="initialize_stt",
+        timeout=10.0,
+    )
+    
+    if not stt_result.success:
+        logger.error(f"Failed to initialize Deepgram STT after retries: {stt_result.error}")
+        raise ValueError(f"STT initialization failed: {stt_result.error}")
+    
+    stt = stt_result.value
+    logger.info("Using Deepgram flux-general-en model for English STT")
     
     # Configure TTS - Use Cartesia plugin with your own API key
     cartesia_api_key = os.getenv("CARTESIA_API_KEY")
@@ -200,21 +217,66 @@ async def my_agent(ctx: agents.JobContext):
     
     logger.info("Cartesia API key found, using Cartesia plugin")
     
-    # TTS configuration - Cartesia with language and voice parameters
-    # Always use English TTS for outbound calls
-    try:
-        tts = cartesia.TTS(
-            model="sonic-3",
-            voice="0834f3df-e650-4766-a20c-5a93a43aa6e3",
-            language=stt_tts_language,  # English
-            speed=tts_speed,
-            volume=tts_volume,
-            emotion=tts_emotion,
+    # TTS configuration with fallback support
+    # Try ElevenLabs first (preferred), then fallback to Cartesia
+    tts = None
+    tts_initialized = False
+    
+    # Try ElevenLabs first
+    eleven_api_key = os.getenv("ELEVEN_API_KEY")
+    if eleven_api_key:
+        try:
+            from livekit.plugins import elevenlabs
+            eleven_model = os.getenv("ELEVEN_MODEL_EN", "eleven_flash_v2_5")
+            eleven_voice = os.getenv("ELEVEN_VOICE_ID_EN", "ODq5zmih8GrVes37Dizd")
+            
+            async def init_elevenlabs():
+                return elevenlabs.TTS(
+                    model=eleven_model,
+                    voice_id=eleven_voice,
+                    stability=float(os.getenv("ELEVEN_STABILITY", "0.5")),
+                    similarity_boost=float(os.getenv("ELEVEN_SIMILARITY_BOOST", "0.75")),
+                )
+            
+            eleven_result = await executor.execute(
+                operation=init_elevenlabs,
+                service_name="elevenlabs_tts_init",
+                operation_name="initialize_elevenlabs_tts",
+                timeout=10.0,
+            )
+            
+            if eleven_result.success:
+                tts = eleven_result.value
+                tts_initialized = True
+                logger.info(f"Using ElevenLabs TTS (model: {eleven_model}, language: {stt_tts_language})")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ElevenLabs TTS, will use Cartesia fallback: {e}")
+    
+    # Fallback to Cartesia if ElevenLabs not available
+    if not tts_initialized:
+        async def init_cartesia():
+            return cartesia.TTS(
+                model="sonic-3",
+                voice="0834f3df-e650-4766-a20c-5a93a43aa6e3",
+                language=stt_tts_language,  # English
+                speed=tts_speed,
+                volume=tts_volume,
+                emotion=tts_emotion,
+            )
+        
+        cartesia_result = await executor.execute(
+            operation=init_cartesia,
+            service_name="cartesia_tts_init",
+            operation_name="initialize_cartesia_tts",
+            timeout=10.0,
         )
+        
+        if not cartesia_result.success:
+            logger.error(f"Failed to initialize Cartesia TTS after retries: {cartesia_result.error}")
+            raise ValueError(f"TTS initialization failed: {cartesia_result.error}")
+        
+        tts = cartesia_result.value
         logger.info(f"Using Cartesia TTS (model: sonic-3, language: {stt_tts_language})")
-    except Exception as e:
-        logger.error(f"Failed to initialize Cartesia TTS: {e}")
-        raise
     
     # Configure LLM - Use OpenAI plugin with your own API key
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -227,14 +289,23 @@ async def my_agent(ctx: agents.JobContext):
         raise ValueError("OPENAI_API_KEY is required. Please set it in your .env.local file.")
     
     logger.info("OpenAI API key found, using OpenAI plugin")
-    try:
-        llm = openai.LLM(
-            model="gpt-4.1",  # OpenAI model name (not the inference format)
-        )
-        logger.info("Using OpenAI LLM (model: gpt-4.1)")
-    except Exception as e:
-        logger.error(f"Failed to initialize OpenAI LLM: {e}")
-        raise
+    # Initialize LLM with failure tolerance
+    async def init_llm():
+        return openai.LLM(model="gpt-4.1")
+    
+    llm_result = await executor.execute(
+        operation=init_llm,
+        service_name="openai_llm_init",
+        operation_name="initialize_llm",
+        timeout=10.0,
+    )
+    
+    if not llm_result.success:
+        logger.error(f"Failed to initialize OpenAI LLM after retries: {llm_result.error}")
+        raise ValueError(f"LLM initialization failed: {llm_result.error}")
+    
+    llm = llm_result.value
+    logger.info("Using OpenAI LLM (model: gpt-4.1)")
     
     # Create AgentSession with language-appropriate conversational configuration
     session = AgentSession(
@@ -244,6 +315,21 @@ async def my_agent(ctx: agents.JobContext):
         vad=silero.VAD.load(),
         **conversational_config.to_dict(),
     )
+
+    # Initialize escalation and uncertainty handlers
+    escalation_policy = EscalationPolicy(
+        max_retries_before_escalation=3,
+        enable_graceful_degradation=True,
+        enable_human_transfer=True,
+        human_transfer_threshold=5,
+    )
+    escalation_manager = EscalationManager(session, escalation_policy)
+    uncertainty_handler = UncertaintyHandler(session)
+    
+    # Store handlers in session userdata for access during conversation
+    session.userdata.escalation_manager = escalation_manager
+    session.userdata.uncertainty_handler = uncertainty_handler
+    session.userdata.executor = executor
 
     await session.start(
         room=ctx.room,
@@ -270,10 +356,41 @@ async def my_agent(ctx: agents.JobContext):
     
     ctx.add_shutdown_callback(on_job_shutdown)
 
-    # Generate initial greeting
-    await session.generate_reply(
-        instructions="Greet the user and offer your assistance."
+    # Generate initial greeting with failure tolerance
+    async def generate_greeting():
+        return await session.generate_reply(
+            instructions="Greet the user and offer your assistance."
+        )
+    
+    greeting_result = await executor.execute(
+        operation=generate_greeting,
+        service_name="agent_session",
+        operation_name="initial_greeting",
+        timeout=30.0,
     )
+    
+    if not greeting_result.success:
+        logger.error(f"Failed to generate initial greeting: {greeting_result.error}")
+        # Try to say a simple fallback greeting
+        try:
+            await session.say(
+                "Hello, I'm here to help you. How can I assist you today?",
+                allow_interruptions=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to say fallback greeting: {e}")
+            # If even fallback fails, escalate
+            await escalation_manager._transfer_to_human(
+                FailureContext(
+                    error=e,
+                    category=ErrorCategory.SERVICE_UNAVAILABLE,
+                    attempt_number=1,
+                    total_attempts=1,
+                    elapsed_time=0.0,
+                    service_name="agent_session",
+                    operation_name="initial_greeting",
+                )
+            )
 
 
 if __name__ == "__main__":
