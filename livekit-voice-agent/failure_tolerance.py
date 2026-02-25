@@ -17,7 +17,40 @@ from enum import Enum
 from typing import Any, Callable, Optional, TypeVar, Generic
 from functools import wraps
 
-logger = logging.getLogger(__name__)
+import pybreaker
+from tenacity import (
+    AsyncRetrying,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+    retry_if_exception,
+    before_sleep_log,
+    after_log,
+)
+
+# Try to use structlog, fallback to standard logging
+try:
+    import structlog
+    logger = structlog.get_logger(__name__)
+    STRUCTLOG_AVAILABLE = True
+except ImportError:
+    logger = logging.getLogger(__name__)
+    STRUCTLOG_AVAILABLE = False
+
+# Import metrics and health checks
+try:
+    from .metrics import MetricsCollector
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    MetricsCollector = None
+
+try:
+    from .health_checks import get_health_checker
+    HEALTH_CHECKS_AVAILABLE = True
+except ImportError:
+    HEALTH_CHECKS_AVAILABLE = False
+    get_health_checker = None
 
 T = TypeVar('T')
 
@@ -60,6 +93,16 @@ class RetryConfig:
         ErrorCategory.RATE_LIMIT,
         ErrorCategory.SERVICE_UNAVAILABLE,
     })
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for circuit breaker behavior."""
+    failure_threshold: int = 5  # Open circuit after N failures
+    success_threshold: int = 1  # Close circuit after N successes (in half-open)
+    timeout: int = 60  # Seconds before trying half-open state
+    expected_exception: type[Exception] = Exception  # Exception types to count as failures
+    listeners: list[pybreaker.CircuitBreakerListener] = field(default_factory=list)
 
 
 @dataclass
@@ -160,53 +203,58 @@ class ErrorClassifier:
 
 
 class RetryStrategy:
-    """Implements retry strategies with exponential backoff."""
+    """Implements retry strategies using tenacity."""
     
-    def __init__(self, config: RetryConfig):
+    def __init__(self, config: RetryConfig, error_classifier: ErrorClassifier):
         self.config = config
+        self.error_classifier = error_classifier
     
-    async def calculate_delay(self, attempt: int) -> float:
-        """
-        Calculate delay before next retry attempt.
-        
-        Args:
-            attempt: Current attempt number (0-indexed)
-        
-        Returns:
-            Delay in seconds
-        """
-        if attempt == 0:
-            return 0.0
-        
-        # Exponential backoff: initial_delay * (base ^ (attempt - 1))
-        delay = self.config.initial_delay * (self.config.exponential_base ** (attempt - 1))
-        
-        # Cap at max_delay
-        delay = min(delay, self.config.max_delay)
-        
-        # Add jitter if enabled (random factor between 0.5 and 1.5)
-        if self.config.jitter:
-            import random
-            jitter_factor = 0.5 + random.random()  # 0.5 to 1.5
-            delay *= jitter_factor
-        
-        return delay
-    
-    def should_retry(self, category: ErrorCategory, attempt: int) -> bool:
-        """
-        Determine if an error should be retried.
-        
-        Args:
-            category: Error category
-            attempt: Current attempt number
-        
-        Returns:
-            True if should retry, False otherwise
-        """
-        if attempt >= self.config.max_attempts:
-            return False
-        
+    def _should_retry_exception(self, exception: Exception) -> bool:
+        """Determine if exception should be retried based on error category."""
+        category = self.error_classifier.classify(exception, "")
         return category in self.config.retryable_categories
+    
+    def build_retry_strategy(self, service_name: str = "unknown") -> AsyncRetrying:
+        """
+        Build a tenacity retry strategy from RetryConfig.
+        
+        Args:
+            service_name: Name of the service (for logging)
+        
+        Returns:
+            Configured AsyncRetrying instance
+        """
+        # Build wait strategy: exponential backoff
+        # tenacity's wait_exponential uses multiplier as base delay
+        # Formula: multiplier * (2 ^ (attempt - 1))
+        wait_strategy = wait_exponential(
+            multiplier=self.config.initial_delay,
+            min=self.config.initial_delay,
+            max=self.config.max_delay,
+        )
+        
+        # Add jitter if enabled (random between 0 and 50% of initial delay)
+        if self.config.jitter:
+            wait_strategy = wait_strategy + wait_random(0, self.config.initial_delay * 0.5)
+        
+        # Build retry condition based on error categories
+        retry_condition = retry_if_exception(self._should_retry_exception)
+        
+        # Build stop condition
+        stop_condition = stop_after_attempt(self.config.max_attempts)
+        
+        # Build logging callbacks
+        before_sleep = before_sleep_log(logger, logging.DEBUG)
+        after_retry = after_log(logger, logging.WARNING)
+        
+        return AsyncRetrying(
+            stop=stop_condition,
+            wait=wait_strategy,
+            retry=retry_condition,
+            before_sleep=before_sleep,
+            after=after_retry,
+            reraise=True,  # Re-raise the last exception if all retries fail
+        )
 
 
 class FailureTolerantExecutor:
@@ -218,11 +266,13 @@ class FailureTolerantExecutor:
         self,
         retry_config: Optional[RetryConfig] = None,
         error_classifier: Optional[ErrorClassifier] = None,
+        circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
     ):
         self.retry_config = retry_config or RetryConfig()
-        self.retry_strategy = RetryStrategy(self.retry_config)
         self.error_classifier = error_classifier or ErrorClassifier()
-        self.circuit_breakers: dict[str, dict] = {}  # Service name -> circuit breaker state
+        self.retry_strategy = RetryStrategy(self.retry_config, self.error_classifier)
+        self.circuit_breaker_config = circuit_breaker_config or CircuitBreakerConfig()
+        self.circuit_breakers: dict[str, pybreaker.CircuitBreaker] = {}  # Service name -> pybreaker instance
     
     async def execute(
         self,
@@ -251,70 +301,175 @@ class FailureTolerantExecutor:
         last_error = None
         last_category = None
         
-        # Check circuit breaker
-        if self._is_circuit_open(service_name):
+        # Get or create circuit breaker for this service
+        breaker = self._get_circuit_breaker(service_name)
+        
+        # Check if circuit is open (pybreaker will raise CircuitBreakerError if open)
+        # We check state to avoid unnecessary execution
+        if breaker.current_state == pybreaker.CircuitBreaker.OPEN:
             logger.warning(f"Circuit breaker is OPEN for {service_name}, skipping execution")
             return ExecutionResult(
                 success=False,
-                error=Exception(f"Circuit breaker is open for {service_name}"),
+                error=pybreaker.CircuitBreakerError(f"Circuit breaker is open for {service_name}"),
                 category=ErrorCategory.SERVICE_UNAVAILABLE,
                 attempts=0,
                 elapsed_time=0.0,
             )
         
-        for attempt in range(self.retry_config.max_attempts):
+        # Build tenacity retry strategy
+        retrying = self.retry_strategy.build_retry_strategy(service_name)
+        
+        attempt_count = 0
+        last_error = None
+        last_category = None
+        
+        # Wrap operation with timeout if specified and circuit breaker
+        async def execute_with_timeout():
+            nonlocal attempt_count
+            attempt_count += 1
+            
+            # Record attempt metrics
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_operation_attempt(
+                    service_name, operation_name, attempt_count
+                )
+            
+            # Wrap async operation for circuit breaker
+            # pybreaker doesn't have native async support, so we manually track success/failure
             try:
-                # Execute with optional timeout
                 if timeout:
                     result = await asyncio.wait_for(operation(), timeout=timeout)
                 else:
                     result = await operation()
                 
-                # Success - record and return
-                elapsed_time = time.time() - start_time
-                self._record_success(service_name)
+                # Mark success in circuit breaker
+                breaker.call_succeeded()
                 
+                # Record success metrics
+                if METRICS_AVAILABLE:
+                    MetricsCollector.record_circuit_breaker_success(service_name)
+                
+                return result
+            except Exception as e:
+                # Mark failure in circuit breaker
+                breaker.call_failed()
+                
+                # Record failure metrics
+                if METRICS_AVAILABLE:
+                    MetricsCollector.record_circuit_breaker_failure(service_name)
+                
+                raise
+        
+        try:
+            # Execute with tenacity retry logic
+            result = await retrying(execute_with_timeout)
+            
+            # Success - record and return
+            elapsed_time = time.time() - start_time
+            
+            # Log success
+            if STRUCTLOG_AVAILABLE:
                 logger.info(
-                    f"Operation '{operation_name}' succeeded on attempt {attempt + 1} "
+                    "operation_succeeded",
+                    service=service_name,
+                    operation=operation_name,
+                    attempts=attempt_count,
+                    duration=elapsed_time
+                )
+            else:
+                logger.info(
+                    f"Operation '{operation_name}' succeeded on attempt {attempt_count} "
                     f"(service: {service_name}, elapsed: {elapsed_time:.2f}s)"
                 )
-                
-                return ExecutionResult(
-                    success=True,
-                    value=result,
-                    attempts=attempt + 1,
-                    elapsed_time=elapsed_time,
+            
+            # Record metrics
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_operation_success(service_name, operation_name)
+                MetricsCollector.record_operation_duration(
+                    service_name, operation_name, elapsed_time, success=True
                 )
             
-            except asyncio.TimeoutError as e:
-                last_error = e
-                last_category = ErrorCategory.TIMEOUT
+            return ExecutionResult(
+                success=True,
+                value=result,
+                attempts=attempt_count,
+                elapsed_time=elapsed_time,
+            )
+        
+        except pybreaker.CircuitBreakerError as e:
+            # Circuit breaker is open
+            last_error = e
+            last_category = ErrorCategory.SERVICE_UNAVAILABLE
+            
+            if STRUCTLOG_AVAILABLE:
                 logger.warning(
-                    f"Operation '{operation_name}' timed out on attempt {attempt + 1} "
+                    "operation_blocked_by_circuit_breaker",
+                    service=service_name,
+                    operation=operation_name,
+                    attempts=attempt_count
+                )
+            else:
+                logger.warning(
+                    f"Operation '{operation_name}' blocked by circuit breaker "
                     f"(service: {service_name})"
                 )
             
-            except Exception as e:
-                last_error = e
-                last_category = self.error_classifier.classify(e, service_name)
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_operation_failure(
+                    service_name, operation_name, last_category.value
+                )
+        
+        except asyncio.TimeoutError as e:
+            last_error = e
+            last_category = ErrorCategory.TIMEOUT
+            
+            if STRUCTLOG_AVAILABLE:
                 logger.warning(
-                    f"Operation '{operation_name}' failed on attempt {attempt + 1} "
+                    "operation_timed_out",
+                    service=service_name,
+                    operation=operation_name,
+                    attempts=attempt_count
+                )
+            else:
+                logger.warning(
+                    f"Operation '{operation_name}' timed out after {attempt_count} attempts "
+                    f"(service: {service_name})"
+                )
+            
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_operation_failure(
+                    service_name, operation_name, last_category.value
+                )
+        
+        except Exception as e:
+            last_error = e
+            last_category = self.error_classifier.classify(e, service_name)
+            
+            if STRUCTLOG_AVAILABLE:
+                logger.warning(
+                    "operation_failed",
+                    service=service_name,
+                    operation=operation_name,
+                    attempts=attempt_count,
+                    error_category=last_category.value,
+                    error=str(e)[:100]
+                )
+            else:
+                logger.warning(
+                    f"Operation '{operation_name}' failed after {attempt_count} attempts "
                     f"(service: {service_name}, category: {last_category.value}, error: {str(e)[:100]})"
                 )
             
-            # Determine if we should retry
-            if not self.retry_strategy.should_retry(last_category, attempt + 1):
-                break
-            
-            # Calculate delay and wait
-            delay = await self.retry_strategy.calculate_delay(attempt + 1)
-            if delay > 0:
-                logger.debug(f"Waiting {delay:.2f}s before retry attempt {attempt + 2}")
-                await asyncio.sleep(delay)
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_operation_failure(
+                    service_name, operation_name, last_category.value
+                )
+                MetricsCollector.record_operation_duration(
+                    service_name, operation_name, time.time() - start_time, success=False
+                )
         
         # All retries exhausted - try fallback or escalate
         elapsed_time = time.time() - start_time
-        self._record_failure(service_name)
         
         failure_context = FailureContext(
             error=last_error,
@@ -328,10 +483,32 @@ class FailureTolerantExecutor:
         
         # Try fallback if available
         if fallback:
-            logger.info(f"Attempting fallback for '{operation_name}' (service: {service_name})")
+            if STRUCTLOG_AVAILABLE:
+                logger.info(
+                    "attempting_fallback",
+                    service=service_name,
+                    operation=operation_name
+                )
+            else:
+                logger.info(f"Attempting fallback for '{operation_name}' (service: {service_name})")
+            
             try:
                 fallback_result = await fallback()
-                logger.info(f"Fallback succeeded for '{operation_name}' (service: {service_name})")
+                
+                if STRUCTLOG_AVAILABLE:
+                    logger.info(
+                        "fallback_succeeded",
+                        service=service_name,
+                        operation=operation_name
+                    )
+                else:
+                    logger.info(f"Fallback succeeded for '{operation_name}' (service: {service_name})")
+                
+                if METRICS_AVAILABLE:
+                    MetricsCollector.record_fallback_usage(
+                        service_name, operation_name, "fallback_service"
+                    )
+                
                 return ExecutionResult(
                     success=True,
                     value=fallback_result,
@@ -341,7 +518,15 @@ class FailureTolerantExecutor:
                     escalation_level=EscalationLevel.FALLBACK_SERVICE,
                 )
             except Exception as fallback_error:
-                logger.error(f"Fallback also failed for '{operation_name}': {fallback_error}")
+                if STRUCTLOG_AVAILABLE:
+                    logger.error(
+                        "fallback_failed",
+                        service=service_name,
+                        operation=operation_name,
+                        error=str(fallback_error)
+                    )
+                else:
+                    logger.error(f"Fallback also failed for '{operation_name}': {fallback_error}")
         
         # Determine escalation level
         escalation_level = EscalationLevel.ABORT
@@ -352,11 +537,26 @@ class FailureTolerantExecutor:
         elif last_category == ErrorCategory.QUOTA_EXCEEDED:
             escalation_level = EscalationLevel.HUMAN_TRANSFER
         
-        logger.error(
-            f"Operation '{operation_name}' failed after {self.retry_config.max_attempts} attempts "
-            f"(service: {service_name}, category: {last_category.value}, "
-            f"escalation: {escalation_level.value})"
-        )
+        if STRUCTLOG_AVAILABLE:
+            logger.error(
+                "operation_failed_after_retries",
+                service=service_name,
+                operation=operation_name,
+                attempts=self.retry_config.max_attempts,
+                error_category=last_category.value if last_category else "unknown",
+                escalation_level=escalation_level.value
+            )
+        else:
+            logger.error(
+                f"Operation '{operation_name}' failed after {self.retry_config.max_attempts} attempts "
+                f"(service: {service_name}, category: {last_category.value}, "
+                f"escalation: {escalation_level.value})"
+            )
+        
+        if METRICS_AVAILABLE:
+            MetricsCollector.record_escalation(
+                service_name, operation_name, escalation_level.value
+            )
         
         return ExecutionResult(
             success=False,
@@ -368,57 +568,105 @@ class FailureTolerantExecutor:
             escalation_level=escalation_level,
         )
     
-    def _is_circuit_open(self, service_name: str) -> bool:
-        """Check if circuit breaker is open for a service."""
+    def _get_circuit_breaker(self, service_name: str) -> pybreaker.CircuitBreaker:
+        """Get or create a circuit breaker for a service."""
         if service_name not in self.circuit_breakers:
-            return False
+            # Create a new circuit breaker with configuration
+            breaker = pybreaker.CircuitBreaker(
+                fail_max=self.circuit_breaker_config.failure_threshold,
+                timeout_duration=self.circuit_breaker_config.timeout,
+                expected_exception=self.circuit_breaker_config.expected_exception,
+                listeners=self.circuit_breaker_config.listeners,
+            )
+            
+            # Add logging listener if not already present
+            if not any(isinstance(l, CircuitBreakerLoggingListener) for l in breaker.listeners):
+                breaker.listeners.append(CircuitBreakerLoggingListener(service_name))
+            
+            self.circuit_breakers[service_name] = breaker
+            
+            if STRUCTLOG_AVAILABLE:
+                logger.debug("circuit_breaker_created", service=service_name)
+            else:
+                logger.debug(f"Created circuit breaker for {service_name}")
+            
+            # Record initial state
+            if METRICS_AVAILABLE:
+                MetricsCollector.record_circuit_breaker_state(service_name, 'closed')
         
-        breaker = self.circuit_breakers[service_name]
-        if breaker['state'] == 'open':
-            # Check if we should try again (half-open state)
-            if time.time() - breaker['last_failure'] > 60:  # 60 second cooldown
-                breaker['state'] = 'half-open'
-                return False
-            return True
-        
-        return False
+        return self.circuit_breakers[service_name]
+
+
+class CircuitBreakerLoggingListener(pybreaker.CircuitBreakerListener):
+    """Logging listener for circuit breaker state changes."""
     
-    def _record_success(self, service_name: str):
-        """Record a successful operation (for circuit breaker)."""
-        if service_name not in self.circuit_breakers:
-            self.circuit_breakers[service_name] = {
-                'state': 'closed',
-                'success_count': 0,
-                'failure_count': 0,
-                'last_failure': 0,
-            }
-        
-        breaker = self.circuit_breakers[service_name]
-        breaker['success_count'] += 1
-        
-        # Reset circuit breaker on success
-        if breaker['state'] == 'half-open':
-            breaker['state'] = 'closed'
-            breaker['failure_count'] = 0
+    def __init__(self, service_name: str):
+        self.service_name = service_name
     
-    def _record_failure(self, service_name: str):
-        """Record a failed operation (for circuit breaker)."""
-        if service_name not in self.circuit_breakers:
-            self.circuit_breakers[service_name] = {
-                'state': 'closed',
-                'success_count': 0,
-                'failure_count': 0,
-                'last_failure': 0,
-            }
+    def state_change(self, cb: pybreaker.CircuitBreaker, old_state: str, new_state: str):
+        """Called when circuit breaker state changes."""
+        if STRUCTLOG_AVAILABLE:
+            logger.warning(
+                "circuit_breaker_state_change",
+                service=self.service_name,
+                old_state=old_state,
+                new_state=new_state
+            )
+        else:
+            logger.warning(
+                f"Circuit breaker for {self.service_name} changed state: {old_state} -> {new_state}"
+            )
         
-        breaker = self.circuit_breakers[service_name]
-        breaker['failure_count'] += 1
-        breaker['last_failure'] = time.time()
-        
-        # Open circuit breaker after 5 consecutive failures
-        if breaker['failure_count'] >= 5:
-            breaker['state'] = 'open'
-            logger.warning(f"Circuit breaker OPENED for {service_name} after 5 failures")
+        if METRICS_AVAILABLE:
+            MetricsCollector.record_circuit_breaker_state_change(
+                self.service_name, old_state, new_state
+            )
+            MetricsCollector.record_circuit_breaker_state(self.service_name, new_state)
+    
+    def failure(self, cb: pybreaker.CircuitBreaker, exc: Exception):
+        """Called when a failure is recorded."""
+        if STRUCTLOG_AVAILABLE:
+            logger.debug(
+                "circuit_breaker_failure",
+                service=self.service_name,
+                error=str(exc)
+            )
+        else:
+            logger.debug(f"Circuit breaker for {self.service_name} recorded failure: {exc}")
+    
+    def success(self, cb: pybreaker.CircuitBreaker):
+        """Called when a success is recorded."""
+        if STRUCTLOG_AVAILABLE:
+            logger.debug("circuit_breaker_success", service=self.service_name)
+        else:
+            logger.debug(f"Circuit breaker for {self.service_name} recorded success")
+    
+    def opened(self, cb: pybreaker.CircuitBreaker, exc: Exception):
+        """Called when circuit breaker opens."""
+        if STRUCTLOG_AVAILABLE:
+            logger.warning(
+                "circuit_breaker_opened",
+                service=self.service_name,
+                failures=cb.fail_counter
+            )
+        else:
+            logger.warning(
+                f"Circuit breaker for {self.service_name} OPENED after {cb.fail_counter} failures"
+            )
+    
+    def closed(self, cb: pybreaker.CircuitBreaker):
+        """Called when circuit breaker closes."""
+        if STRUCTLOG_AVAILABLE:
+            logger.info("circuit_breaker_closed", service=self.service_name)
+        else:
+            logger.info(f"Circuit breaker for {self.service_name} CLOSED (recovered)")
+    
+    def half_opened(self, cb: pybreaker.CircuitBreaker):
+        """Called when circuit breaker enters half-open state."""
+        if STRUCTLOG_AVAILABLE:
+            logger.info("circuit_breaker_half_opened", service=self.service_name)
+        else:
+            logger.info(f"Circuit breaker for {self.service_name} entered HALF-OPEN state (testing)")
 
 
 # Convenience decorator for failure-tolerant execution
